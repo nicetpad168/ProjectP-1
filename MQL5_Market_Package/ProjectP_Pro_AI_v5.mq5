@@ -32,6 +32,8 @@
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
+#include <Trade\DealInfo.mqh>
+#include <Trade\HistoryOrderInfo.mqh>
 
 //+------------------------------------------------------------------+
 //| Input Parameters - Organized for MQL5 Market                   |
@@ -42,15 +44,19 @@ input double InpAIConfidence = 0.75;               // AI Confidence Level (0.5-0
 input bool InpAdaptiveLearning = true;             // Enable Adaptive Learning
 
 input group "💰 === RISK MANAGEMENT ==="
-input double InpMaxRiskPerTrade = 2.0;            // Max Risk Per Trade (%)
-input double InpMaxDrawdown = 15.0;               // Maximum Drawdown (%)
+input double InpMaxRiskPerTrade = 1.0;            // Max Risk Per Trade (%) - Conservative for $100
+input double InpMaxDrawdown = 10.0;               // Maximum Drawdown (%) - Tight control
 input bool InpUseAdaptiveRisk = true;             // Use Adaptive Risk Management
+input bool InpUseProgressiveRisk = true;          // Use Progressive Risk (compound effect)
+input double InpMaxDailyRisk = 5.0;               // Maximum Daily Risk (%)
 
 input group "📊 === POSITION MANAGEMENT ==="
-input double InpBaseLotSize = 0.1;                // Base Lot Size
+input double InpBaseLotSize = 0.01;               // Base Lot Size (for manual override)
 input bool InpUseTrailingStop = true;             // Use Trailing Stop
 input double InpTrailingDistance = 50.0;          // Trailing Distance (points)
 input double InpRiskRewardRatio = 2.0;            // Risk:Reward Ratio
+input bool InpUseCompounding = true;              // Use Compound Growth
+input double InpMinAccountBalance = 100.0;        // Minimum Account Balance (USD)
 
 input group "📈 === TECHNICAL ANALYSIS ==="
 input int InpMA_Fast = 20;                        // Fast Moving Average
@@ -112,6 +118,16 @@ struct RiskManagement {
     double risk_per_trade;
     bool risk_ok;
     datetime last_check;
+    
+    // Enterprise additions
+    double daily_risk_used;
+    double session_high_equity;
+    double session_low_equity;
+    datetime session_start;
+    int trades_today;
+    double max_position_size;
+    bool emergency_stop;
+    double compound_factor;
 } g_risk;
 
 //--- Performance Tracking
@@ -124,6 +140,18 @@ struct PerformanceStats {
     double win_rate;
     double max_drawdown;
     datetime start_time;
+    
+    // Enterprise additions
+    double sharpe_ratio;
+    double calmar_ratio;
+    double recovery_factor;
+    double consecutive_wins;
+    double consecutive_losses;
+    double avg_trade_duration;
+    double daily_pnl[31]; // Last 31 days P&L
+    int monthly_trades[12]; // Monthly trade count
+    double growth_rate;
+    double roi_percentage;
 } g_stats;
 
 //--- Indicator handles
@@ -182,6 +210,13 @@ int OnInit()
     Print("🛡️ Max Risk: ", InpMaxRiskPerTrade, "%");
     Print("📈 Multi-TF: ", InpUseMultiTF ? "ENABLED" : "DISABLED");
     
+    // Backtest mode detection
+    if(MQLInfoInteger(MQL_TESTER)) {
+        Print("🧪 BACKTEST MODE: Deterministic initialization enabled");
+    } else {
+        Print("📈 LIVE MODE: Random initialization enabled");
+    }
+    
     return INIT_SUCCEEDED;
 }
 
@@ -236,6 +271,12 @@ void ProcessNewBar()
     if(InpEnableLogging) 
         Print("📊 Processing new bar: ", TimeToString(TimeCurrent()));
     
+    // Emergency stop check
+    if(g_risk.emergency_stop) {
+        Print("🚨 EMERGENCY STOP ACTIVE - No new trades");
+        return;
+    }
+    
     // Update complete market analysis
     if(!UpdateMarketAnalysis()) {
         Print("⚠️ Market analysis update failed");
@@ -245,6 +286,13 @@ void ProcessNewBar()
     // Check risk limits
     if(!CheckRiskLimits()) {
         Print("🚫 Risk limits exceeded");
+        return;
+    }
+    
+    // Daily trade limit for small accounts
+    if(g_risk.trades_today >= 5 && AccountInfoDouble(ACCOUNT_BALANCE) < 500.0) {
+        if(InpEnableLogging) 
+            Print("📊 Daily trade limit reached for small account");
         return;
     }
     
@@ -286,6 +334,13 @@ bool InitIndicators()
 //+------------------------------------------------------------------+
 void InitNeuralNetwork()
 {
+    // Initialize with fixed seed for consistent backtest results
+    if(MQLInfoInteger(MQL_TESTER)) {
+        MathSrand(12345); // Fixed seed for backtest reproducibility
+    } else {
+        MathSrand(GetTickCount()); // Random seed for live trading
+    }
+    
     // Initialize weights randomly
     for(int i = 0; i < 10; i++) {
         for(int j = 0; j < 8; j++) {
@@ -315,7 +370,7 @@ void InitMarketAnalysis()
 }
 
 //+------------------------------------------------------------------+
-//| Initialize risk management                                       |
+//| Initialize risk management - Enterprise Grade                   |
 //+------------------------------------------------------------------+
 void InitRiskManagement()
 {
@@ -324,6 +379,29 @@ void InitRiskManagement()
     g_risk.peak_equity = g_risk.current_equity;
     g_risk.risk_per_trade = InpMaxRiskPerTrade;
     g_risk.risk_ok = true;
+    g_risk.emergency_stop = false;
+    g_risk.compound_factor = 1.0;
+    
+    // Initialize enterprise features
+    g_risk.session_start = TimeCurrent();
+    g_risk.session_high_equity = g_risk.current_equity;
+    g_risk.session_low_equity = g_risk.current_equity;
+    g_risk.daily_risk_used = 0.0;
+    g_risk.trades_today = 0;
+    g_risk.max_position_size = 0.0;
+    
+    // Validate minimum balance
+    if(g_risk.current_equity < InpMinAccountBalance) {
+        Print("⚠️ WARNING: Account balance below recommended minimum");
+        Print("💰 Current: $", g_risk.current_equity, " | Recommended: $", InpMinAccountBalance);
+    }
+    
+    if(InpEnableLogging) {
+        Print("🛡️ Enterprise Risk Management initialized");
+        Print("💵 Starting Balance: $", NormalizeDouble(g_risk.current_equity, 2));
+        Print("📊 Max Risk per Trade: ", InpMaxRiskPerTrade, "%");
+        Print("📈 Max Daily Risk: ", InpMaxDailyRisk, "%");
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -603,34 +681,92 @@ void ExecuteTradeSignal(double signal)
         Print("✅ Trade executed: ", EnumToString(order_type), 
               " | Size: ", lot_size, 
               " | Price: ", price,
-              " | Confidence: ", NormalizeDouble(g_network.last_confidence * 100, 1), "%");
+              " | Confidence: ", NormalizeDouble(g_network.last_confidence * 100, 1), "%",
+              " | Balance: $", NormalizeDouble(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+        
         g_stats.total_trades++;
+        g_risk.trades_today++;
+        g_risk.daily_risk_used += g_risk.risk_per_trade;
+        
+        // Log enterprise metrics
+        if(InpEnableLogging) {
+            Print("📊 Risk Used Today: ", NormalizeDouble(g_risk.daily_risk_used, 2), "%");
+            Print("📈 Compound Factor: ", NormalizeDouble(g_risk.compound_factor, 2));
+        }
     } else {
         Print("❌ Trade failed: ", trade.ResultComment());
     }
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size                                               |
+//| Calculate lot size - Enterprise Grade for Small Accounts        |
 //+------------------------------------------------------------------+
 double CalculateLotSize()
 {
     double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double risk_amount = balance * g_risk.risk_per_trade / 100.0;
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
     
+    // Check minimum balance requirement
+    if(balance < InpMinAccountBalance) {
+        if(InpEnableLogging) 
+            Print("⚠️ Account balance below minimum: ", balance);
+        return 0.0;
+    }
+    
+    // Progressive risk calculation for compounding
+    double effective_risk = g_risk.risk_per_trade;
+    if(InpUseProgressiveRisk && InpUseCompounding) {
+        double growth_factor = balance / InpMinAccountBalance;
+        if(growth_factor > 2.0) {
+            effective_risk = MathMin(effective_risk * 1.2, InpMaxRiskPerTrade * 1.5);
+        }
+    }
+    
+    // Calculate risk amount
+    double risk_amount = equity * effective_risk / 100.0;
+    
+    // Daily risk limit check
+    if(g_risk.daily_risk_used + effective_risk > InpMaxDailyRisk) {
+        if(InpEnableLogging) 
+            Print("🚫 Daily risk limit exceeded: ", g_risk.daily_risk_used, "%");
+        return 0.0;
+    }
+    
+    // ATR-based stop distance
     double stop_distance = g_market.atr_value * 2.0;
+    if(stop_distance == 0) stop_distance = 50 * _Point; // Fallback
+    
+    // Broker specifications
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    
-    double lot_size = risk_amount / (stop_distance * tick_value / tick_size);
-    
-    // Normalize to broker requirements
     double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
     double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
     
+    // Calculate lot size
+    double lot_size = 0.0;
+    if(tick_value > 0 && tick_size > 0) {
+        lot_size = risk_amount / (stop_distance * tick_value / tick_size);
+    } else {
+        // Fallback calculation for small accounts
+        lot_size = risk_amount / (stop_distance / _Point * 10); // Approximate
+    }
+    
+    // Special handling for small accounts ($100-$500)
+    if(balance <= 500.0) {
+        lot_size = MathMax(lot_size, 0.01); // Minimum for microlots
+        lot_size = MathMin(lot_size, 0.10); // Maximum for safety
+    }
+    
+    // Normalize to broker requirements
     lot_size = MathMax(min_lot, MathMin(max_lot, lot_size));
     lot_size = NormalizeDouble(lot_size / lot_step, 0) * lot_step;
+    
+    // Final safety check
+    if(lot_size < min_lot) lot_size = min_lot;
+    
+    // Update max position tracking
+    g_risk.max_position_size = MathMax(g_risk.max_position_size, lot_size);
     
     return lot_size;
 }
@@ -653,7 +789,7 @@ void CalculateStopLevels(ENUM_ORDER_TYPE order_type, double price,
 }
 
 //+------------------------------------------------------------------+
-//| Check risk limits                                                |
+//| Check risk limits - Enterprise Grade                            |
 //+------------------------------------------------------------------+
 bool CheckRiskLimits()
 {
@@ -664,28 +800,79 @@ bool CheckRiskLimits()
         g_risk.peak_equity = g_risk.current_equity;
     }
     
-    // Calculate drawdown
+    // Calculate current drawdown
     double drawdown = (g_risk.peak_equity - g_risk.current_equity) / 
                      g_risk.peak_equity * 100.0;
+    g_risk.current_drawdown = drawdown;
     
+    // Maximum drawdown check
     if(drawdown > InpMaxDrawdown) {
         Print("🚫 Maximum drawdown exceeded: ", NormalizeDouble(drawdown, 2), "%");
+        g_risk.emergency_stop = true;
+        return false;
+    }
+    
+    // Daily risk reset
+    MqlDateTime dt;
+    MqlDateTime session_dt;
+    TimeToStruct(TimeCurrent(), dt);
+    TimeToStruct(g_risk.session_start, session_dt);
+    if(dt.day != session_dt.day) {
+        ResetDailyRisk();
+    }
+    
+    // Session equity tracking
+    if(g_risk.current_equity > g_risk.session_high_equity) {
+        g_risk.session_high_equity = g_risk.current_equity;
+    }
+    if(g_risk.current_equity < g_risk.session_low_equity) {
+        g_risk.session_low_equity = g_risk.current_equity;
+    }
+    
+    // Emergency stop conditions for small accounts
+    if(AccountInfoDouble(ACCOUNT_BALANCE) < InpMinAccountBalance * 0.8) {
+        Print("🚨 EMERGENCY STOP: Balance below 80% of minimum");
+        g_risk.emergency_stop = true;
         return false;
     }
     
     // Adaptive risk adjustment
     if(InpUseAdaptiveRisk) {
-        if(drawdown > 10.0) {
-            g_risk.risk_per_trade = InpMaxRiskPerTrade * 0.5;
-        } else if(drawdown < 2.0) {
-            g_risk.risk_per_trade = InpMaxRiskPerTrade * 1.1;
+        if(drawdown > 7.0) {
+            g_risk.risk_per_trade = InpMaxRiskPerTrade * 0.3; // Ultra conservative
+        } else if(drawdown > 5.0) {
+            g_risk.risk_per_trade = InpMaxRiskPerTrade * 0.5; // Conservative
+        } else if(drawdown < 1.0 && g_stats.win_rate > 60.0) {
+            g_risk.risk_per_trade = InpMaxRiskPerTrade * 1.1; // Slightly aggressive
         } else {
-            g_risk.risk_per_trade = InpMaxRiskPerTrade;
+            g_risk.risk_per_trade = InpMaxRiskPerTrade; // Normal
         }
     }
     
+    // Calculate compound factor for progressive sizing
+    if(InpUseCompounding) {
+        double initial_balance = InpMinAccountBalance;
+        g_risk.compound_factor = g_risk.current_equity / initial_balance;
+    }
+    
     g_risk.risk_ok = true;
+    g_risk.last_check = TimeCurrent();
     return true;
+}
+
+//+------------------------------------------------------------------+
+//| Reset daily risk counters                                        |
+//+------------------------------------------------------------------+
+void ResetDailyRisk()
+{
+    g_risk.daily_risk_used = 0.0;
+    g_risk.trades_today = 0;
+    g_risk.session_start = TimeCurrent();
+    g_risk.session_high_equity = g_risk.current_equity;
+    g_risk.session_low_equity = g_risk.current_equity;
+    
+    if(InpEnableLogging) 
+        Print("📅 Daily risk counters reset");
 }
 
 //+------------------------------------------------------------------+
@@ -785,8 +972,16 @@ void TrainNetwork()
 {
     static double last_prediction = 0;
     static datetime last_train = 0;
+    static int bar_count = 0;
     
-    if(TimeCurrent() - last_train < 300) return; // Train every 5 minutes
+    // Use bar count for consistent timing in backtest
+    if(MQLInfoInteger(MQL_TESTER)) {
+        bar_count++;
+        if(bar_count < 5) return; // Train every 5 bars in backtest
+        bar_count = 0;
+    } else {
+        if(TimeCurrent() - last_train < 300) return; // Train every 5 minutes in live
+    }
     
     // Simple training based on price movement
     if(g_price_buffer[0] != 0 && g_price_buffer[1] != 0) {
@@ -814,19 +1009,34 @@ void UpdateMarketData()
 {
     g_market.current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
-    // Update price buffer
+    // Update price buffer - use bar-based update for backtest consistency
     static datetime last_update = 0;
-    if(TimeCurrent() - last_update > 60) {
-        for(int i = 99; i > 0; i--) {
-            g_price_buffer[i] = g_price_buffer[i-1];
+    static int last_bar_count = 0;
+    
+    if(MQLInfoInteger(MQL_TESTER)) {
+        // In backtest, update every bar
+        datetime current_bar = iTime(_Symbol, _Period, 0);
+        if(current_bar != last_update) {
+            for(int i = 99; i > 0; i--) {
+                g_price_buffer[i] = g_price_buffer[i-1];
+            }
+            g_price_buffer[0] = g_market.current_price;
+            last_update = current_bar;
         }
-        g_price_buffer[0] = g_market.current_price;
-        last_update = TimeCurrent();
+    } else {
+        // In live, update every minute
+        if(TimeCurrent() - last_update > 60) {
+            for(int i = 99; i > 0; i--) {
+                g_price_buffer[i] = g_price_buffer[i-1];
+            }
+            g_price_buffer[0] = g_market.current_price;
+            last_update = TimeCurrent();
+        }
     }
 }
 
 //+------------------------------------------------------------------+
-//| Update statistics                                                |
+//| Update statistics - Enterprise Grade                            |
 //+------------------------------------------------------------------+
 void UpdateStatistics()
 {
@@ -835,6 +1045,29 @@ void UpdateStatistics()
         
         if(g_stats.total_loss > 0) {
             g_stats.profit_factor = g_stats.total_profit / g_stats.total_loss;
+        }
+        
+        // Calculate enterprise metrics
+        double initial_balance = InpMinAccountBalance;
+        double current_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+        
+        // ROI calculation
+        g_stats.roi_percentage = (current_balance - initial_balance) / initial_balance * 100.0;
+        
+        // Growth rate (daily compound)
+        double days_trading = (TimeCurrent() - g_stats.start_time) / 86400.0;
+        if(days_trading > 0) {
+            g_stats.growth_rate = MathPow(current_balance / initial_balance, 1.0 / days_trading) - 1.0;
+        }
+        
+        // Recovery factor
+        if(g_stats.max_drawdown > 0) {
+            g_stats.recovery_factor = g_stats.roi_percentage / g_stats.max_drawdown;
+        }
+        
+        // Update max drawdown
+        if(g_risk.current_drawdown > g_stats.max_drawdown) {
+            g_stats.max_drawdown = g_risk.current_drawdown;
         }
     }
 }
@@ -877,22 +1110,30 @@ void ReleaseIndicators()
 }
 
 //+------------------------------------------------------------------+
-//| Show final statistics                                            |
+//| Show final statistics - Enterprise Grade                        |
 //+------------------------------------------------------------------+
 void ShowFinalStatistics()
 {
     if(!InpShowStatistics) return;
     
-    Print("📊 === ProjectP Professional AI - Final Statistics ===");
+    Print("📊 === ProjectP Professional AI - Enterprise Statistics ===");
     Print("💼 Total Trades: ", g_stats.total_trades);
     Print("🎯 Win Rate: ", NormalizeDouble(g_stats.win_rate, 2), "%");
     Print("💰 Profit Factor: ", NormalizeDouble(g_stats.profit_factor, 2));
+    Print("📈 ROI: ", NormalizeDouble(g_stats.roi_percentage, 2), "%");
+    Print("🚀 Growth Rate: ", NormalizeDouble(g_stats.growth_rate * 100, 4), "% daily");
+    Print("📉 Max Drawdown: ", NormalizeDouble(g_stats.max_drawdown, 2), "%");
+    Print("🔄 Recovery Factor: ", NormalizeDouble(g_stats.recovery_factor, 2));
+    Print("💵 Start Balance: $", InpMinAccountBalance);
+    Print("💵 Current Balance: $", NormalizeDouble(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+    Print("💪 Compound Factor: ", NormalizeDouble(g_risk.compound_factor, 2), "x");
     
     if(InpEnableAI) {
         Print("🤖 AI Training Sessions: ", g_network.training_count);
     }
     
     Print("⏱️ Trading Duration: ", (TimeCurrent() - g_stats.start_time) / 3600, " hours");
+    Print("🏆 Enterprise Grade Performance Tracking Complete");
     Print("===============================================");
 }
 
@@ -922,6 +1163,57 @@ void OnTimer()
 void OnTrade()
 {
     UpdateStatistics();
+}
+
+//+------------------------------------------------------------------+
+//| OnTester function - Enterprise Grade Optimization               |
+//+------------------------------------------------------------------+
+double OnTester()
+{
+    // Calculate enterprise-grade fitness value
+    UpdateStatistics();
+    
+    if(g_stats.total_trades < 5) return 0.0; // Need minimum trades for small accounts
+    
+    // Enterprise optimization criteria
+    double fitness = 0.0;
+    
+    // ROI factor (0-30 points) - Most important for $100 account
+    if(g_stats.roi_percentage > 0) {
+        fitness += MathMin(g_stats.roi_percentage * 0.3, 30);
+    }
+    
+    // Win rate factor (0-25 points)
+    fitness += g_stats.win_rate * 0.25;
+    
+    // Profit factor (0-20 points)
+    if(g_stats.profit_factor > 1.0) {
+        fitness += MathMin(g_stats.profit_factor * 8, 20);
+    }
+    
+    // Recovery factor (0-15 points) - Risk-adjusted returns
+    if(g_stats.recovery_factor > 0) {
+        fitness += MathMin(g_stats.recovery_factor * 3, 15);
+    }
+    
+    // Drawdown penalty (0-10 points)
+    if(g_stats.max_drawdown < 5.0) {
+        fitness += 10;
+    } else if(g_stats.max_drawdown < 10.0) {
+        fitness += 5;
+    }
+    
+    // Compound growth bonus for small accounts
+    if(g_risk.compound_factor > 1.5) {
+        fitness += 10; // Bonus for successful compounding
+    }
+    
+    // AI performance factor (0-5 points)
+    if(InpEnableAI && g_network.training_count > 0) {
+        fitness += MathMin(g_network.training_count * 0.05, 5);
+    }
+    
+    return fitness;
 }
 
 //+------------------------------------------------------------------+
