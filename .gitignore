@@ -1,0 +1,44 @@
+# MT5 compiled files
+*.ex5
+*.ex4
+
+# MetaEditor files
+*.log
+*.exp
+
+# Backup files
+*.bak
+*~
+
+# Temporary files
+*.tmp
+*.temp
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test results
+/Tester/
+/MQL5/Files/
+/MQL5/Logs/
+
+# Personal settings
+personal_settings.txt
+account_config.txt
+
+# Optimization results
+optimization_*.csv
+backtest_results/
+
+# Reports
+reports/
+*.html
+*.pdf
